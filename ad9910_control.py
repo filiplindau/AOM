@@ -108,15 +108,15 @@ class AD9910Control(object):
     def init_dds(self):
         reg = "CFR1"
         data = [0b11100000, 0b00000000, 0b00000000, 0b00000010]
-        data = [0b01100000, 0b00000000, 0b00000000, 0b00000000]
+        data = [0b11100000, 0b00000000, 0b00000000, 0b00000000]
         self._write(reg, data)
 
         reg = "CFR2"
-        data = [0b0000000, 0b00000000, 0b00000000, 0b00000000]  # SYNC_CLK enable
+        data = [0b0000000, 0b01000000, 0b00000000, 0b00000000]  # SYNC_CLK enable
         self._write(reg, data)
 
         reg = "CFR3"
-        data = [0b0000000, 0b00000000, 0b10000000, 0b00000000]
+        data = [0b0000000, 0b00000000, 0b11000000, 0b00000000]  # REFCLK inpuit div bypass + REFCLK input div resetB
         self._write(reg, data)
 
         self._io_update()
@@ -129,14 +129,14 @@ class AD9910Control(object):
         logger.info("Setting output frequency {0} Hz".format(f_out))
         if f_out > self.sys_clk / 2:
             logger.warning("Frequency higher than nyquist frequency, aliasing will occur")
-        ftw = np.uint32(2**32 * (f_out / self.sys_clk))
+        ftw = np.uint32((2**32 - 1) * (f_out / self.sys_clk))
         self._set_ftw(ftw)
 
     def set_single_tone(self, n_profile, f_out, amplitude=1.0, phase=0.0):
-        ftw = np.uint32(2 ** 32 * (f_out / self.sys_clk))
+        ftw = np.uint32((2 ** 32 - 1) * (f_out / self.sys_clk))
 
-        asf = np.uint16(2**16 * amplitude)
-        ph = np.uint16(phase/(2*np.pi) * 2**16)
+        asf = np.uint16((2**16 - 1) * amplitude)
+        ph = np.uint16(phase/(2*np.pi) * (2**16 - 1))
         data = [(asf >> 8), (asf & 0xff), (ph >> 8), (ph & 0xff),
                 (ftw >> 24), (ftw >> 16) & 0xff, (ftw >> 8) & 0xff, ftw & 0xff]
         reg = "PROFILE{0}".format(n_profile)
@@ -144,22 +144,55 @@ class AD9910Control(object):
 
     def set_phase(self, phase):
         logger.info("Setting output phase to {0} radians".format(phase))
-        pow = np.uint16(phase * 2**16 / (2 * np.pi))
+        pow = np.uint16(phase * (2**16 - 1) / (2 * np.pi))
         self._set_pow(pow)
 
-    def set_ram_profile(self, n_profile, start, end, step_time):
+    def set_ram_profile(self, n_profile, start, end, step_time, mode="CONTINUOUS_RECIRCULATE"):
+        """
+        Setup RAM profile
+
+        :param n_profile: Profile number to set: 0-7
+        :param start: Starting RAM address 0-1023
+        :param end: Ending RAM address 0-1023
+        :param step_time: Time between RAM steps, seconds
+        :param mode: Sweep mode: "CONTINUOUS_RECIRCULATE", "RAMP-UP", "BIDIRECTIONAL_RAMP",
+        "CONTINUOUS_BIDIRECTIONAL_RAMP", or "DIRECT_SWITCH"
+        :return:
+        """
         if isinstance(step_time, float):
             step_time = int(step_time * self.sys_clk / 4)
         sr_high = (step_time >> 8) & 0xff
         sr_low = step_time & 0xff
-        end_high = end / 4
+        end_high = (end >> 2) & 0xff
         end_low = (end & 0b11) * 0x40
-        start_high = start / 4
+        start_high = (start >> 2) & 0xff
         start_low = (start & 0b11) * 0x40
-        data = [0, sr_high, sr_low, end_high, end_low, start_high, start_low, 0]
+        if mode == "CONTINUOUS_RECIRCULATE":
+            mode_bits = 0b100
+        elif mode == "RAMP-UP":
+            mode_bits = 0b001
+        elif mode == "BIDIRECTIONAL_RAMP":
+            mode_bits = 0b010
+        elif mode == "CONTINUOUS_BIDIRECTIONAL_RAMP":
+            mode_bits = 0b001
+        else:
+            mode_bits = 0b000   # DIRECT_SWITCH
+        data = [0, sr_high, sr_low, end_high, end_low, start_high, start_low, mode_bits]
         reg = "PROFILE{0}".format(n_profile)
         self._write(reg, data)
         self._io_update()
+
+    def enable_ram(self, enable=True):
+        logger.info("Setting RAM enable to {0}".format(enable))
+        reg = "CFR1"
+        data = self._read(reg, 4)
+        if enable:
+            # If PLL is disable, just set that bit and exit
+            data[0] = data[0] | 0b10000000
+        else:
+            data[0] = data[0] & 0b01111111
+
+        self._write(reg, data)
 
     def set_pll(self, pll_enable, pll_multiplier, vco_sel=7, ch_pump_current=7, input_div_bypass=True):
         logger.info("Set_pll: PLL enable {0}, mult {1}, vco_sel {2}, "
@@ -220,7 +253,10 @@ class AD9910Control(object):
         reg = "RAM"
         if len(data) > 1024:
             raise(IndexError("Max ram size is 1024, got {0}".format(len(data))))
-        self._write(reg, data)
+        w_data = list()
+        for d in reversed(data):
+            w_data.extend([(d >> 24), (d >> 16) & 0xff, (d >> 8) & 0xff, d & 0xff])
+        self._write(reg, w_data)
 
     def _set_ftw(self, ftw):
         data = [(ftw >> 24), (ftw >> 16) & 0xff, (ftw >> 8) & 0xff, ftw & 0xff]
@@ -285,6 +321,7 @@ class AD9910Control(object):
         self._toggle_pin("IO_RESET")
         time.sleep(10e-6)
         self._write_bytes(w_data, stall_high=True)
+        time.sleep(10e-6)
         # Write data to register:
         w_data = [int(np.uint8(x)) for x in data]
         self._write_bytes(w_data, stall_high=True)
@@ -334,7 +371,9 @@ class AD9910Control(object):
         # Select read register:
         logger.debug("Read instruction data: {0}".format(w_data))
         self._toggle_pin("IO_RESET")
+        time.sleep(10e-6)
         self._write_bytes(w_data, stall_high=True)
+        time.sleep(10e-6)
         # Read data from register:
         data = self._read_bytes(n_bytes)
         return data
